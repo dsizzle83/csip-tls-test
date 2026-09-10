@@ -233,6 +233,55 @@ func read704(ctx context.Context, rc *certify.RunCtx) (got sunspec.ACControls, o
 	return sunspec.Parse704(regs), true, ""
 }
 
+// read702CtrlModes reads the DER's own model 702 CtrlModes capability
+// bitfield through the same southbound oracle path read704 uses —
+// independent of both the mbaps and CSIP lanes — for EXT-008's own
+// precondition: does this DER declare FIXED_W at all?
+//
+// REV0907-D2-P6C: on the bench solar DER it does not, and a standing mbaps
+// WSet write drew Modbus exception 02 (illegal data address) from the
+// product's own pre-ack capability gate (internal/authority mbapsin.go's
+// setpoint-axis-incapable rule) before any envelope arbitration ever ran —
+// WSet is simply not a commandable point on a DER that never advertises the
+// capability, the same way a legacy 12x DER's absent model 704 makes it not a
+// commandable point at all (oracleFixedW's own LEGACY branch). The write
+// SPAN itself is not in question: TestL704EnvelopeSpansAreContiguous already
+// pins WSetEna(1)+WSetMod(1)+WSet(2) as exactly the 4 contiguous registers
+// ext008WriteWSet requests, matching L704's own declared field types
+// (Tenum16, Tenum16, Tint32) register-for-register, so the exception is the
+// capability gate, not a span crossing a non-writable point.
+func read702CtrlModes(ctx context.Context, rc *certify.RunCtx) (modes uint32, ok bool, why string) {
+	uv, err := oracleUnitView(ctx, rc, oracleSimName)
+	if err != nil {
+		return 0, false, err.Error()
+	}
+	regs := uv.Regs[702]
+	if len(regs) == 0 {
+		return 0, false, "the DER serves no model 702, so its CtrlModes capability bitfield cannot be read"
+	}
+	return sunspec.Parse702(regs).CtrlModes, true, ""
+}
+
+// ext008DeclaresFixedW answers EXT-008's own precondition question from an
+// already-read CtrlModes bitfield — split out from read702CtrlModes so the
+// bit test is directly unit-testable without a live sim
+// (TestExt008DeclaresFixedW).
+func ext008DeclaresFixedW(modes uint32) bool {
+	return modes&sunspec.M702_CtrlMode_FixedW != 0
+}
+
+// ext008PreconditionUnavailable is stashed under all three of EXT-008's
+// criterion keys when the DER does not declare FIXED_W in its own model 702
+// CtrlModes — the same "IMPLEMENTED BUT PRECONDITIONED" shape
+// ext007PreconditionUnavailable documents: SKIP with a load-bearing reason,
+// never a FAIL of the DUT for a capability the DER itself never claims.
+func ext008PreconditionUnavailable(reason string) Finding {
+	return unavailable("this row's precondition (the DER declaring FIXED_W in its own model 702 "+
+		"CtrlModes) is not met: %s. WSet is not a commandable point on a DER that does not advertise the "+
+		"capability (REV0907-D2-P6C) — run this row against a DER that declares FIXED_W (e.g. the battery "+
+		"DER) or arrange one on this bench and re-run", reason)
+}
+
 // ── Finding stash: Observation.Params carries only strings ──────────────────
 
 func stashFinding(params map[string]string, key string, f Finding) {
@@ -795,12 +844,37 @@ func gradeAxisOwnedRefusal(w envelopeWriteOutcome, before, after sunspec.ACContr
 }
 
 // gradeAxisReleaseDefault is EXT-006's second criterion — the device-default
-// half, graded against the baseline Setup stashed BEFORE the CSIP control was
-// ever published, per owner answer B.
+// half, graded against the axis's own pre-publication baseline (Setup, before
+// either author ever touched it), per owner answer B.
+//
+// # "Device default" is about what is IN FORCE, not about the raw register
+//
+// A 704 DER's PFWInj_PF register keeps its LAST-WRITTEN contents after
+// PFWInjEna is cleared — that is what a value register on this model does,
+// not a release failure (REV0907-D2-P6C's own bench evidence: WSet stayed
+// 3200 while lexa-modbus logged the WSet axis withdrawn — "the device reports
+// no active-power setpoint in force" — with WSetEna correctly cleared). So
+// this grader's asserted claim is PFWInjEna matching the baseline's own
+// PFWInjEna, not the raw PF register matching the baseline's raw PF register:
+//
+//   - Ena mismatched against the baseline is UNCONDITIONALLY a FAIL — this is
+//     REV0907-D2-P6A's own shape: a control that ended but left the axis
+//     still CSIP-owned (Ena/ownership never cleared, or cleared when the
+//     baseline itself held it).
+//   - Ena matched and FALSE (the ordinary case: neither author's default
+//     state is "in force") is a PASS regardless of what the raw register
+//     holds — the register is read and reported alongside it, never
+//     asserted on, because §2's release rule is a claim about what the DER
+//     is DOING, not about what one register remembers.
+//   - Ena matched and TRUE (an unusual but legal factory default that ships
+//     with the PF axis already in force) additionally requires the raw
+//     value to match the baseline's — if the axis is genuinely in force,
+//     "the device default" means the DEFAULT VALUE, not merely some value.
 func gradeAxisReleaseDefault(params map[string]string, atRelease sunspec.ACControls, ok bool, why string) Finding {
 	baselinePF, havePF := params["ext006.baseline_pf"], params["ext006.baseline_pf"] != ""
+	baselineEnaStr, haveEna := params["ext006.baseline_ena"], params["ext006.baseline_ena"] != ""
 	baselineExt := params["ext006.baseline_ext"]
-	if !havePF {
+	if !havePF || !haveEna {
 		return unavailable("this row's own pre-publication baseline was never captured, so the device- " +
 			"default claim cannot be checked against anything")
 	}
@@ -815,18 +889,39 @@ func gradeAxisReleaseDefault(params map[string]string, atRelease sunspec.ACContr
 	if _, err := fmt.Sscanf(baselineExt, "%d", &wantExtReg); err != nil {
 		return unavailable("this row's own stashed baseline excitation %q did not parse: %v", baselineExt, err)
 	}
+	wantEna := baselineEnaStr == "true"
+
+	if atRelease.PFWInjEna != wantEna {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"at release PFWInjEna reads %t, not matching this row's own pre-publication baseline enable "+
+				"state (%t) — %s §2 owner answer B requires the axis to return to the device default "+
+				"IN-FORCE state (this is REV0907-D2-P6A's own shape if PFWInjEna is still true: the axis "+
+				"left CSIP-owned) (raw PF register, reported not asserted: pf=%s ext=%d, baseline was "+
+				"pf=%s ext=%s)", atRelease.PFWInjEna, wantEna, envelopeDesignDoc, trimNum(atRelease.PFWInjPF),
+			atRelease.PFWInjExt, baselinePF, baselineExt)}
+	}
+	if !wantEna {
+		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+			"at release PFWInjEna reads false, matching this row's own pre-publication baseline (also "+
+				"false) — the axis is no longer in force, the device default %s §2 owner answer B "+
+				"requires (reported, not asserted: raw PF register reads pf=%s ext=%d, baseline was pf=%s "+
+				"ext=%s — a 704 DER's value register keeps its last-written contents after Ena clears, "+
+				"which is not what this claim is about)", envelopeDesignDoc, trimNum(atRelease.PFWInjPF),
+			atRelease.PFWInjExt, baselinePF, baselineExt)}
+	}
 	if abs(atRelease.PFWInjPF-wantPF) <= fixedPFTolerance && atRelease.PFWInjExt == wantExtReg {
 		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-			"at release the DER's PF register reads pf=%s ext=%d, matching this row's own "+
-				"pre-publication baseline (pf=%s ext=%s) — the device default, not a prior mbaps value "+
-				"(%s §2 owner answer B)", trimNum(atRelease.PFWInjPF), atRelease.PFWInjExt, baselinePF,
-			baselineExt, envelopeDesignDoc)}
+			"at release the DER's PF register reads pf=%s ext=%d with PFWInjEna=true, matching this "+
+				"row's own pre-publication baseline (pf=%s ext=%s, also in force) — the device default, "+
+				"not a prior mbaps value (%s §2 owner answer B)", trimNum(atRelease.PFWInjPF),
+			atRelease.PFWInjExt, baselinePF, baselineExt, envelopeDesignDoc)}
 	}
 	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-		"at release the DER's PF register reads pf=%s ext=%d, which does NOT match this row's own "+
-			"pre-publication baseline (pf=%s ext=%s) — %s §2 owner answer B requires the axis to return "+
-			"to the device default on release, not to some other value",
-		trimNum(atRelease.PFWInjPF), atRelease.PFWInjExt, baselinePF, baselineExt, envelopeDesignDoc)}
+		"at release PFWInjEna=true (matching the baseline's own in-force state), but the DER's PF "+
+			"register reads pf=%s ext=%d, which does NOT match this row's own pre-publication baseline "+
+			"value (pf=%s ext=%s) — %s §2 owner answer B requires the device DEFAULT value when the "+
+			"baseline itself holds the axis in force", trimNum(atRelease.PFWInjPF), atRelease.PFWInjExt,
+		baselinePF, baselineExt, envelopeDesignDoc)}
 }
 
 // gradeAxisReleasedWrite is EXT-006's third criterion.
@@ -873,26 +968,119 @@ const (
 	ext007ESKey      = "ext007.es"
 )
 
+// ext007OutageWaitDefaultS is this row's own default wait window for the DUT
+// to report failsafe_engaged=true after gridsim's northbound outage lever
+// (R2, REV0907-D2) cuts its CSIP session off — overridable via -param
+// ext007.failsafe_wait_s=<seconds>. The bench's shipped failsafe.json
+// declares grace_s=900 (15 min — lexa-gw cmd/mode/config_test.go's "the
+// shipped grace_s=900 must not warn" case is this exact value), and 960 s
+// adds a minute of margin on top of the DUT's own grace period so this row's
+// own poll cadence can never itself be the reason the wait comes up short.
+const ext007OutageWaitDefaultS = 960
+
+// ext007OutagePollInterval is how often this row re-reads the DUT's own
+// failsafe_engaged posture while waiting for it to flip, in either
+// direction — short enough that the bundle records roughly WHEN a flip
+// happened, not merely that it eventually did.
+const ext007OutagePollInterval = 15 * time.Second
+
+// ext007ReleaseWaitS bounds how long this row waits, after releasing the
+// outage lever, for the DUT to report failsafe_engaged=false again before
+// moving on. A DUT slow to disengage is worth the log line this produces —
+// not a reason for teardown to hang indefinitely, and not part of R2's own
+// claim (which is about behaviour WHILE engaged).
+const ext007ReleaseWaitS = 300
+
+// ext007OutageAutoClearMarginS pads gridsim's own outage duration_s beyond
+// this row's wait+release budget, so a run that panics or is killed mid-row
+// still has the lever auto-clear (sim/gridsim/outage.go's own auto-clear)
+// rather than leaving the bench northbound-dead for whatever runs next —
+// belt-and-suspenders alongside this row's own explicit ClearOutage calls in
+// both PostWait and Cleanup.
+const ext007OutageAutoClearMarginS = 120
+
 // ext007PreconditionUnavailable is stashed under both criteria's keys when
-// this row's own precondition — the DUT already in a fail-safe-engaged
-// posture — is not met. This harness has no lever that can DRIVE a DUT into
-// fail-safe: the fail-safe engages on comm-loss to the CSIP server (design
-// §1.5), and no admin endpoint in sim/gridsim (checked: AdminClient's only
-// operations are Status/Logs/Control/Clock/Responses/DERPuts/LogEvents/
-// Chain/SwapChain/RestoreChain — nothing silences or pauses the server) lets
-// this bench simulate a comm-loss from inside a certify run. So this row is
-// IMPLEMENTED BUT PRECONDITIONED, exactly as the task that requested it
-// anticipated: it reads the DUT's own reported posture
-// (certify.ReadAuthority's FailsafeEngaged, the same field
-// preflight_authority.go already reads off GET /mode) and grades for real
-// when an operator has engaged the fail-safe out of band before the run —
-// otherwise both criteria report this reason as SKIP, never as a FAIL of the
-// DUT for a precondition this bench itself could not arrange.
+// this row cannot reach a fail-safe-engaged DUT at all: neither is the DUT
+// already there (an operator arranged it out of band before the run) nor is
+// gridsim's admin API reachable to drive it there with the northbound outage
+// lever (R2, AdminClient.Outage). SKIP with this reason, never a FAIL of the
+// DUT for a precondition this bench could not arrange.
 func ext007PreconditionUnavailable(reason string) Finding {
-	return unavailable("this row's precondition (the DUT already in a fail-safe-engaged posture) is not "+
-		"met: %s. No lever in this harness can DRIVE a DUT into fail-safe — sim/gridsim's admin API has "+
-		"no silence/pause endpoint — so this row is IMPLEMENTED BUT PRECONDITIONED: engage the fail-safe "+
-		"out of band (e.g. block the DUT's route to gridsim, or power gridsim off) and re-run", reason)
+	return unavailable("this row's precondition (the DUT in a fail-safe-engaged posture) is not met: %s",
+		reason)
+}
+
+// ext007DriveOutcome is what ext007DecideDrive answers: given the DUT's own
+// reported posture and whether gridsim's admin API is reachable, how (if at
+// all) can this row reach a fail-safe-engaged DUT? Split out from PostWait's
+// live network calls so the three shapes are directly unit-testable
+// (TestExt007DecideDrive) without a live gateway or gridsim.
+type ext007DriveOutcome int
+
+const (
+	// ext007AlreadyEngaged: the DUT already reports failsafe_engaged=true —
+	// an operator arranged it out of band before the run. Grade directly;
+	// nothing to arm.
+	ext007AlreadyEngaged ext007DriveOutcome = iota
+	// ext007ShouldDrive: not engaged yet, but gridsim's admin API is
+	// reachable — arm the northbound outage lever (R2) and wait for it.
+	ext007ShouldDrive
+	// ext007CannotReach: not engaged, and no lever is reachable to drive it
+	// there — SKIP.
+	ext007CannotReach
+)
+
+// ext007DecideDrive is the pure decision behind the three shapes above.
+func ext007DecideDrive(alreadyEngaged, adminAvailable bool) ext007DriveOutcome {
+	switch {
+	case alreadyEngaged:
+		return ext007AlreadyEngaged
+	case adminAvailable:
+		return ext007ShouldDrive
+	default:
+		return ext007CannotReach
+	}
+}
+
+// ext007OutageWaitSeconds resolves this row's own wait window for the DUT to
+// report failsafe_engaged=true after the outage lever is armed — -param
+// ext007.failsafe_wait_s=<seconds>, defaulting to ext007OutageWaitDefaultS.
+// An absent, empty, unparseable or non-positive value falls back to the
+// default rather than erroring: this parameter tunes a bench timing, and a
+// malformed value silently keeping the documented default is a better
+// failure mode than a row that cannot run at all over an operator typo.
+func ext007OutageWaitSeconds(rc *certify.RunCtx) int {
+	if v, ok := rc.Param("ext007.failsafe_wait_s"); ok && v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return ext007OutageWaitDefaultS
+}
+
+// ext007AwaitFailsafe polls the DUT's own failsafe_engaged posture
+// (certify.ReadAuthority) every ext007OutagePollInterval until it equals
+// want or waitS elapses. reached reports which was last observed; err is
+// non-nil only for a READ failure — a posture that honestly stayed the wrong
+// value for the whole window is a false return, not an error.
+func ext007AwaitFailsafe(ctx context.Context, d *Driver, want bool, waitS int) (reached bool, err error) {
+	deadline := time.Now().Add(time.Duration(waitS) * time.Second)
+	for {
+		reading, rerr := certify.ReadAuthority(ctx, d.rc.Gateway, certify.DefaultDevAPI)
+		if rerr != nil {
+			return false, rerr
+		}
+		if reading.FailsafeEngaged == want {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		if err := d.rc.Sleep(ctx, ext007OutagePollInterval); err != nil {
+			return false, err
+		}
+	}
 }
 
 func envelopeFailsafeOverride(nonce string) certify.Check {
@@ -908,6 +1096,22 @@ func envelopeFailsafeOverride(nonce string) certify.Check {
 // own doc says runs unconditionally and is the right hook for "a fact that is
 // internal DUT state and not wire-observable at all", exactly CORE-005's own
 // precedent for reading rc.Gateway/the dev API rather than the wire.
+//
+// R2 (REV0907-D2): this row no longer only WAITS for an operator to have
+// engaged the DUT's fail-safe out of band. When gridsim's admin API is
+// reachable (d.Admin.Available()) it DRIVES the DUT there itself: arms
+// gridsim's northbound outage lever (AdminClient.Outage, mode "down" —
+// every CSIP request the DUT makes is answered 503) for this row's own wait
+// window plus a bench-safety margin, polls the DUT's own failsafe_engaged
+// posture (ext007AwaitFailsafe) until it flips true or the window elapses,
+// runs the same two writes/grades as before, then releases the lever
+// (ClearOutage) and waits — best-effort, logged, never fatal to this row's
+// own verdict — for the DUT to report disengaged before returning. A DUT an
+// operator already engaged out of band (still supported, for a bench with no
+// admin API configured) skips straight to grading. Only when NEITHER path is
+// available — not already engaged, and no admin API to drive it — does this
+// row fall back to the SKIP shape ext007PreconditionUnavailable documents.
+// ext007DecideDrive is the pure decision the three shapes rest on.
 func envelopeFailsafeOverrideSpec(nonce string) spec {
 	return spec{
 		PostWait: func(ctx context.Context, d *Driver, params map[string]string) error {
@@ -925,18 +1129,55 @@ func envelopeFailsafeOverrideSpec(nonce string) spec {
 				stashFinding(params, ext007ESKey, f)
 				return nil
 			}
-			if !reading.FailsafeEngaged {
-				f := ext007PreconditionUnavailable(fmt.Sprintf("the DUT reports %s", reading.String()))
+
+			drove := false
+			switch ext007DecideDrive(reading.FailsafeEngaged, d.Admin.Available()) {
+			case ext007CannotReach:
+				f := ext007PreconditionUnavailable(fmt.Sprintf("the DUT reports %s, and no gridsim admin "+
+					"API is configured to drive it there with the northbound outage lever (R2)",
+					reading.String()))
 				stashFinding(params, ext007CeilingKey, f)
 				stashFinding(params, ext007ESKey, f)
 				return nil
+			case ext007ShouldDrive:
+				waitS := ext007OutageWaitSeconds(d.rc)
+				outageDurationS := waitS + ext007ReleaseWaitS + ext007OutageAutoClearMarginS
+				if err := d.Admin.Outage(ctx, certify.AdminOutageDown, outageDurationS, 0); err != nil {
+					f := unavailable("could not arm gridsim's northbound outage lever to drive the DUT "+
+						"into fail-safe (R2): %v", err)
+					stashFinding(params, ext007CeilingKey, f)
+					stashFinding(params, ext007ESKey, f)
+					return nil
+				}
+				d.rc.Logf("EXT-007: armed gridsim's northbound outage (mode=%s) — waiting up to %s for "+
+					"the DUT to report failsafe_engaged=true", certify.AdminOutageDown,
+					(time.Duration(waitS) * time.Second).Round(time.Second))
+				engaged, waitErr := ext007AwaitFailsafe(ctx, d, true, waitS)
+				if waitErr != nil || !engaged {
+					_ = d.Admin.ClearOutage(ctx)
+					reason := fmt.Sprintf("armed gridsim's northbound outage lever, but the DUT never "+
+						"reported failsafe_engaged=true within %ds", waitS)
+					if waitErr != nil {
+						reason = fmt.Sprintf("%s: %v", reason, waitErr)
+					}
+					f := ext007PreconditionUnavailable(reason)
+					stashFinding(params, ext007CeilingKey, f)
+					stashFinding(params, ext007ESKey, f)
+					return nil
+				}
+				drove = true
 			}
+			// ext007AlreadyEngaged falls straight through to grading below —
+			// nothing to arm, nothing to release.
 
 			sess, skip := suitessm.DialEnvelopeRole(ctx, d.rc, gridServiceRole)
 			if skip != nil {
 				f := unavailable("could not open the mbaps GridService session this row needs: %s", skip.Notes)
 				stashFinding(params, ext007CeilingKey, f)
 				stashFinding(params, ext007ESKey, f)
+				if drove {
+					_ = d.Admin.ClearOutage(ctx)
+				}
 				return nil
 			}
 			defer sess.Close()
@@ -971,12 +1212,34 @@ func envelopeFailsafeOverrideSpec(nonce string) spec {
 				stashFinding(params, ext007ESKey,
 					unavailable("the DUT's mbaps chain (%v) serves no model 703", sess.Chain.IDs()))
 			}
+
+			if drove {
+				if err := d.Admin.ClearOutage(ctx); err != nil {
+					d.rc.Logf("EXT-007: could not release gridsim's northbound outage lever: %v — "+
+						"Cleanup will retry", err)
+				} else if _, err := ext007AwaitFailsafe(ctx, d, false, ext007ReleaseWaitS); err != nil {
+					d.rc.Logf("EXT-007: released the outage lever, but could not confirm the DUT "+
+						"reported failsafe_engaged=false within %ds: %v (not fatal to this row's own "+
+						"verdict — the disengage window is a bench courtesy, not part of R2's own claim, "+
+						"which is about behaviour WHILE engaged)", ext007ReleaseWaitS, err)
+				}
+			}
 			return nil
 		},
+		Cleanup: func(ctx context.Context, d *Driver) {
+			// Safety net: idempotent when PostWait already released the
+			// lever, and the only release path left when PostWait returned
+			// early (a transport error mid-row) without reaching its own
+			// ClearOutage call.
+			if d.Admin.Available() {
+				_ = d.Admin.ClearOutage(ctx)
+			}
+		},
 		Notes: func(o *Observation) string {
-			return fmt.Sprintf("checked the DUT's own reported control posture and, when it reported "+
-				"fail-safe engaged, wrote an mbaps GridServiceSunSpec WMaxLimPct above zero export and a "+
-				"703 ES=1 — %s §1.5/§2, owner answer C", envelopeDesignDoc)
+			return fmt.Sprintf("drove the DUT into a fail-safe-engaged posture with gridsim's northbound "+
+				"outage lever (R2) — or found one already arranged out of band — then over a role-bound "+
+				"mbaps GridServiceSunSpec session wrote a WMaxLimPct above zero export and a 703 ES=1, "+
+				"then released the lever — %s §1.5/§2, owner answer C", envelopeDesignDoc)
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -1136,6 +1399,22 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 	return spec{
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
+			modes, modesOK, modesWhy := read702CtrlModes(ctx, d.rc)
+			if !modesOK || !ext008DeclaresFixedW(modes) {
+				reason := fmt.Sprintf("could not read the DER's own CtrlModes: %s", modesWhy)
+				if modesOK {
+					reason = fmt.Sprintf("the DER's own CtrlModes reads 0x%08x, with bit 1 (FIXED_W) clear",
+						modes)
+				}
+				f := ext008PreconditionUnavailable(reason)
+				stashFinding(params, ext008StandingKey, f)
+				stashFinding(params, ext008OwnershipKey, f)
+				stashFinding(params, ext008DefaultKey, f)
+				params["ext008.precondition_met"] = "false"
+				return nil
+			}
+			params["ext008.precondition_met"] = "true"
+
 			base, ok, why := read704(ctx, d.rc)
 			if !ok {
 				f := unavailable("could not read the DER's own pre-publication model 704 image to "+
@@ -1229,9 +1508,19 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 				o.Waited.Round(rounding), ext008SecondWattsW, envelopeDesignDoc)
 		},
 		Criteria: func(o *Observation) []criterion {
-			return []criterion{
-				critResponseStarted(mrid),
-				{
+			crits := []criterion{}
+			// No CSIP control is ever published when EXT-008's own
+			// precondition (the DER declaring FIXED_W) is unmet — Setup
+			// returns before PostControl in that case. critResponseStarted
+			// would then grade a control that was never sent as a FAIL,
+			// which is not what this row's SKIP means; EXT-007's own
+			// precondition (which also publishes no control) has no such
+			// criterion for the same reason.
+			if o.Params["ext008.precondition_met"] != "false" {
+				crits = append(crits, critResponseStarted(mrid))
+			}
+			return append(crits,
+				criterion{
 					Claim: fmt.Sprintf("an mbaps GridServiceSunSpec 704 WSet write made BEFORE any CSIP "+
 						"opModFixedW control is in effect stands: it is acked and the DER's own WSet "+
 						"register reads it (%.1f W) — %s §2 (\"else mbaps\")",
@@ -1244,7 +1533,7 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 						return recallFinding(o.Params, ext008StandingKey)
 					},
 				},
-				{
+				criterion{
 					Claim: fmt.Sprintf("once the CSIP opModFixedW control (%s) starts, the DER's own WSet "+
 						"register follows CSIP's commanded value (%.2f%%), not the standing mbaps value, "+
 						"and a further mbaps WSet write (%.1f W) draws Modbus exception 01 (illegal "+
@@ -1260,7 +1549,7 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 						return recallFinding(o.Params, ext008OwnershipKey)
 					},
 				},
-				{
+				criterion{
 					Claim: fmt.Sprintf("when the control ends, the DER's own WSet register returns to the "+
 						"device default captured at this row's own pre-publication baseline, not to the "+
 						"prior mbaps value (%.1f W) — %s §2 owner answer B", ext008StandingWattsW,
@@ -1274,7 +1563,7 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 						return recallFinding(o.Params, ext008DefaultKey)
 					},
 				},
-			}
+			)
 		},
 	}
 }
@@ -1361,10 +1650,19 @@ func gradeOwnershipTakeEffect(follows Finding, w envelopeWriteOutcome) Finding {
 			"correctly drew Modbus exception 01 (illegal function)", follows.Observed)}
 }
 
-// gradeSetpointReleaseDefault is EXT-008's third criterion.
+// gradeSetpointReleaseDefault is EXT-008's third criterion — the same
+// enable-point-first grading gradeAxisReleaseDefault documents for EXT-006's
+// PF axis, applied to WSet/WSetEna: a 704 DER's WSet register keeps its
+// last-written contents after WSetEna clears (REV0907-D2-P6C's own bench
+// evidence for this exact axis), so the asserted claim is WSetEna matching
+// the baseline's own WSetEna, not the raw WSet register matching the
+// baseline's raw WSet. See gradeAxisReleaseDefault's doc for the three cases
+// (Ena mismatched -> FAIL, Ena matched false -> PASS regardless of the raw
+// register, Ena matched true -> the raw value must also match).
 func gradeSetpointReleaseDefault(params map[string]string, atRelease sunspec.ACControls, ok bool, why string) Finding {
 	baseline, have := params["ext008.baseline_wset"], params["ext008.baseline_wset"] != ""
-	if !have {
+	baselineEnaStr, haveEna := params["ext008.baseline_wset_ena"], params["ext008.baseline_wset_ena"] != ""
+	if !have || !haveEna {
 		return unavailable("this row's own pre-publication baseline was never captured, so the device-" +
 			"default claim cannot be checked against anything")
 	}
@@ -1375,18 +1673,39 @@ func gradeSetpointReleaseDefault(params map[string]string, atRelease sunspec.ACC
 	if _, err := fmt.Sscanf(baseline, "%g", &wantW); err != nil {
 		return unavailable("this row's own stashed baseline WSet %q did not parse: %v", baseline, err)
 	}
+	wantEna := baselineEnaStr == "true"
 	tol := atRelease.WSetStepW
 	if tol <= 0 {
 		tol = ext008WSetFallbackToleranceW
 	}
+
+	if atRelease.WSetEna != wantEna {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"at release WSetEna reads %t, not matching this row's own pre-publication baseline enable "+
+				"state (%t) — %s §2 owner answer B requires the axis to return to the device default "+
+				"IN-FORCE state (this is REV0907-D2-P6A's own shape if WSetEna is still true: the axis "+
+				"left CSIP-owned) (raw WSet register, reported not asserted: %.1f W, baseline was %.1f W)",
+			atRelease.WSetEna, wantEna, envelopeDesignDoc, atRelease.WSet, wantW)}
+	}
+	if !wantEna {
+		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+			"at release WSetEna reads false, matching this row's own pre-publication baseline (also "+
+				"false) — the axis is no longer in force, the device default %s §2 owner answer B "+
+				"requires (reported, not asserted: raw WSet register reads %.1f W, baseline was %.1f W, "+
+				"standing mbaps write was %.1f W — a 704 DER's value register keeps its last-written "+
+				"contents after Ena clears, which is not what this claim is about)", envelopeDesignDoc,
+			atRelease.WSet, wantW, ext008StandingWattsW)}
+	}
 	if math.Abs(atRelease.WSet-wantW) <= tol {
 		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-			"at release the DER's WSet register reads %.1f W, matching this row's own pre-publication "+
-				"baseline (%.1f W) — the device default, not the prior mbaps value (%.1f W) (%s §2 owner "+
-				"answer B)", atRelease.WSet, wantW, ext008StandingWattsW, envelopeDesignDoc)}
+			"at release the DER's WSet register reads %.1f W with WSetEna=true, matching this row's "+
+				"own pre-publication baseline (%.1f W, also in force) — the device default, not the "+
+				"prior mbaps value (%.1f W) (%s §2 owner answer B)", atRelease.WSet, wantW,
+			ext008StandingWattsW, envelopeDesignDoc)}
 	}
 	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-		"at release the DER's WSet register reads %.1f W, which does NOT match this row's own "+
-			"pre-publication baseline (%.1f W) — %s §2 owner answer B requires the axis to return to "+
-			"the device default on release", atRelease.WSet, wantW, envelopeDesignDoc)}
+		"at release WSetEna=true (matching the baseline's own in-force state), but the DER's WSet "+
+			"register reads %.1f W, which does NOT match this row's own pre-publication baseline value "+
+			"(%.1f W) — %s §2 owner answer B requires the device DEFAULT value when the baseline itself "+
+			"holds the axis in force", atRelease.WSet, wantW, envelopeDesignDoc)}
 }

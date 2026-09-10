@@ -167,6 +167,58 @@ func TestAdminClientAndSimClient(t *testing.T) {
 	}
 }
 
+// TestAdminClientOutage pins the wire shape of REV0907-D2 R2's fail-safe
+// lever (Outage/ClearOutage): Outage must POST the mode/duration/hang fields
+// gridsim's handleAdminOutage decodes (sim/gridsim/outage.go), and
+// ClearOutage must POST {"clear":true} — the two payload shapes gridsim's own
+// handler tells apart by which field is set. A mutation that swapped
+// ClearOutage to send {"mode":""} instead (a plausible but WRONG "clear"
+// spelling — gridsim's handler only clears on req.Clear, never on an empty
+// mode string) would arm nothing, leave the outage as it was, and this test
+// would catch it: it asserts on the actual JSON body, not just "a POST
+// happened".
+func TestAdminClientOutage(t *testing.T) {
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/outage" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	admin := NewAdminClient(srv.URL, nil)
+	if err := admin.Outage(context.Background(), AdminOutageDown, 960, 0); err != nil {
+		t.Fatalf("Outage: %v", err)
+	}
+	if err := admin.ClearOutage(context.Background()); err != nil {
+		t.Fatalf("ClearOutage: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests, want 2", len(bodies))
+	}
+
+	arm := bodies[0]
+	if arm["mode"] != AdminOutageDown {
+		t.Errorf("arm body mode = %v, want %q", arm["mode"], AdminOutageDown)
+	}
+	if got := arm["duration_s"]; got != float64(960) {
+		t.Errorf("arm body duration_s = %v, want 960", got)
+	}
+	if _, present := arm["clear"]; present {
+		t.Errorf("arm body carries a clear field: %+v — gridsim's handler would honour it and clear nothing", arm)
+	}
+
+	clear := bodies[1]
+	if clear["clear"] != true {
+		t.Errorf("clear body clear = %v, want true", clear["clear"])
+	}
+}
+
 func TestUnconfiguredClientsFailLoudly(t *testing.T) {
 	if err := NewAdminClient("", nil).Status(context.Background(), nil); err == nil {
 		t.Error("an unconfigured admin client succeeded")

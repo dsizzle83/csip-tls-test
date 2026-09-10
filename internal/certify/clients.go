@@ -235,6 +235,53 @@ func (a *AdminClient) Raw(ctx context.Context, method, path string, body any) ([
 	return a.do(ctx, method, path, body)
 }
 
+// Outage modes accepted by POST /admin/outage — see sim/gridsim/outage.go for
+// what each one does to a CSIP request in flight. Duplicated here as literal
+// wire values, not an import of the simulator package: this client talks to
+// gridsim only over its admin HTTP API, the same arm's-length relationship
+// every other AdminClient method on this type keeps (RBAC-independence,
+// referee-independence — CLAUDE.md).
+const (
+	// AdminOutageDown answers every CSIP request with an immediate 503 —
+	// gridsim's model of a dead or rebooting head-end. This is the mode
+	// REV0907-D2-P6/EXT-007 (localext_envelope.go) arms to DRIVE a DUT's own
+	// fail-safe rather than waiting for an operator to arrange one out of
+	// band: a DUT whose CSIP session sees nothing but refusals for its own
+	// configured grace period has no other honest reading of the world.
+	AdminOutageDown = "down"
+	AdminOutageHang = "hang"
+	AdminOutageSlow = "slow"
+)
+
+// Outage arms gridsim's northbound outage lever (POST /admin/outage): every
+// CSIP request the DUT makes is answered per mode (AdminOutageDown/Hang/Slow)
+// until durationS elapses (gridsim auto-clears; 0 means "until explicitly
+// cleared") or ClearOutage is called. hangS configures the "hang"/"slow"
+// timing; 0 takes gridsim's own default.
+//
+// Every caller MUST pair this with a ClearOutage, the same discipline
+// SwapChain/RestoreChain document — a bench left northbound-dead fails every
+// case that runs after it, this row's own included.
+func (a *AdminClient) Outage(ctx context.Context, mode string, durationS, hangS int) error {
+	body := struct {
+		Mode      string `json:"mode"`
+		DurationS int    `json:"duration_s"`
+		HangS     int    `json:"hang_s"`
+	}{Mode: mode, DurationS: durationS, HangS: hangS}
+	return a.Post(ctx, "outage", body, nil)
+}
+
+// ClearOutage releases gridsim's northbound outage lever (POST /admin/outage
+// {"clear":true}), restoring normal CSIP service. It is the RESTORE half
+// every Outage caller must run, in a deferred/Cleanup path so it still runs
+// when the row between the two returns early.
+func (a *AdminClient) ClearOutage(ctx context.Context) error {
+	body := struct {
+		Clear bool `json:"clear"`
+	}{Clear: true}
+	return a.Post(ctx, "outage", body, nil)
+}
+
 // SimClient drives one device simulator's simapi sidecar.
 type SimClient struct {
 	restClient

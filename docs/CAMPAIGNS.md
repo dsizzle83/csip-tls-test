@@ -176,22 +176,46 @@ with the reason it needs that lane. In outline:
   `EXT-006` proves the Fixed PF axis is a VALUE, not a limit: while a CSIP
   `opModFixedPFInjectW` control owns it, an mbaps `PFWInj_PF` write draws
   exception 01 and the DER's own PF register does not move; at release the
-  register reads the DEVICE DEFAULT captured before the CSIP control was ever
-  published (owner answer B — never a prior mbaps value); after release the
-  same write is acked and lands.
+  axis's own `PFWInjEna` enable point reads the DEVICE DEFAULT captured
+  before the CSIP control was ever published (owner answer B — never a prior
+  mbaps value); after release the same write is acked and lands. The
+  release-half grader reads the ENABLE point, not the raw `PFWInj_PF`
+  register: a 704 DER keeps a value register's last-written contents after
+  its `Ena` clears (REV0907-D2-P6C's bench evidence — the WSet axis below
+  shows the identical shape), so the raw register is reported alongside the
+  verdict but never asserted on while the axis is out of force; `PFWInjEna`
+  still `true` at release is unconditionally a FAIL (REV0907-D2-P6A: a
+  control that ended but left the axis CSIP-owned).
   `EXT-007` proves the fail-safe override survives the envelope model: an
   mbaps ceiling write above zero export is still ADMITTED while fail-safe is
   engaged (owner answer C — the single documented exception to "never beyond
-  the envelope"), while a 703 `ES=1` write stays refused. No lever in this
-  bench can DRIVE a DUT into fail-safe, so this row is IMPLEMENTED BUT
-  PRECONDITIONED: it reads the DUT's own reported `failsafe_engaged` posture
-  and SKIPs, naming that reason, when an operator has not engaged it out of
-  band.
+  the envelope"), while a 703 `ES=1` write stays refused. R2 closed this
+  row's own harness gap: it now DRIVES the DUT into fail-safe itself,
+  arming gridsim's northbound outage lever (`POST /admin/outage`,
+  `AdminClient.Outage`/`ClearOutage`, mode `down` — every CSIP request the
+  DUT makes is answered 503) and polling the DUT's own `failsafe_engaged`
+  posture until it flips or a wait window elapses (`-param
+  ext007.failsafe_wait_s`, default 960 s — the bench's shipped `grace_s=900`
+  plus a minute of polling margin), then releasing the lever and waiting
+  (best-effort) for the DUT to disengage before teardown. A DUT an operator
+  already engaged out of band still works, ungated, exactly as before; this
+  row falls back to SKIP, naming the reason, only when the DUT is not
+  already engaged AND no gridsim admin API is configured to drive it there.
   `EXT-008` proves ownership TAKE: a standing mbaps `WSet` write is admitted
   absent any CSIP contribution; once a CSIP `opModFixedW` control starts, the
   DER's own register follows CSIP and a further mbaps write draws exception
-  01; when the control ends the register returns to the device default, not
-  to the standing mbaps value. All four share `csip` for the same reason as
+  01; when the control ends the `WSetEna` enable point (not the raw `WSet`
+  register — the same P6C staleness EXT-006 documents) returns to the device
+  default, not to the standing mbaps value. The row now preconditions on the
+  DER declaring `FIXED_W` in its own model 702 `CtrlModes` (read through the
+  same southbound oracle path every other row's DER-side read uses) and
+  SKIPs, naming the reason, on a DER that does not — REV0907-D2-P6C found
+  the bench solar DER answers Modbus exception 02 for a standing `WSet`
+  write because it declares no `FIXED_W` capability at all, a fixture gap
+  rather than an envelope defect; the write span itself (`WSetEna`+`WSetMod`+
+  `WSet`, 4 registers) is independently pinned contiguous against L704's own
+  declared field types, so the exception is the DER's capability gate, not a
+  span crossing a non-writable point. All four share `csip` for the same reason as
   `EXT-001…004`: a CSIP control's own limits ARE the envelope these rows
   write an mbaps request against, so the CSIP control path must own
   `lexa/desired/*` for there to be an envelope to measure at all.
