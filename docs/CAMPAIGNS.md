@@ -209,13 +209,15 @@ with the reason it needs that lane. In outline:
   default, not to the standing mbaps value. The row now preconditions on the
   DER declaring `FIXED_W` in its own model 702 `CtrlModes` (read through the
   same southbound oracle path every other row's DER-side read uses) and
-  SKIPs, naming the reason, on a DER that does not — REV0907-D2-P6C found
-  the bench solar DER answers Modbus exception 02 for a standing `WSet`
-  write because it declares no `FIXED_W` capability at all, a fixture gap
-  rather than an envelope defect; the write span itself (`WSetEna`+`WSetMod`+
-  `WSet`, 4 registers) is independently pinned contiguous against L704's own
-  declared field types, so the exception is the DER's capability gate, not a
-  span crossing a non-writable point. All four share `csip` for the same reason as
+  SKIPs, naming the reason, on a DER that does not. REV0907-D2-P6C's
+  exception 02 on the standing `WSet` write was first read as that
+  capability gate; the 2026-09-10 re-run passed the precondition and still
+  drew 02, and the source is the product's SUN-002 pre-ack executability
+  gate: `WSetMod` has no executor in lexa-mode, so the row's original single
+  span `WSetEna`+`WSetMod`+`WSet` was refused before the ack. The row now
+  writes the axis as two requests that never cover `WSetMod` — `WSet` (2
+  registers) then `WSetEna` (1 register), both pinned contiguous against
+  L704's own declared field types. All four share `csip` for the same reason as
   `EXT-001…004`: a CSIP control's own limits ARE the envelope these rows
   write an mbaps request against, so the CSIP control path must own
   `lexa/desired/*` for there to be an envelope to measure at all.

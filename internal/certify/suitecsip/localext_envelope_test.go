@@ -72,11 +72,14 @@ var errBoom = boomErr{}
 // ── L704/L703 contiguity: every write helper's load-bearing assumption ──────
 
 // TestL704EnvelopeSpansAreContiguous pins that WMaxLimPctEna+WMaxLimPct,
-// PFWInj_PF+PFWInj_Ext and WSetEna+WSetMod+WSet are contiguous in L704's
-// declared field order — if a re-vendor ever moved one, ext005Write/
-// ext006Write/ext008Write's single Write Multiple Registers request would
-// silently write the WRONG registers, and this test is what would catch it
-// before a live write did.
+// PFWInj_PF+PFWInj_Ext, WSet (alone, 2 registers) and WSetEna (alone, 1
+// register) are contiguous in L704's declared field order — if a re-vendor
+// ever moved one, ext005Write/ext006Write/ext008WriteWSet's Write Multiple
+// Registers requests would silently write the WRONG registers, and this test
+// is what would catch it before a live write did. WSetMod is deliberately NOT
+// in any span: the product refuses a window covering it with exception 02
+// before the ack (no executor, SUN-002 — REV0907-D2-P6C), so the WSet axis is
+// written as two requests around it.
 func TestL704EnvelopeSpansAreContiguous(t *testing.T) {
 	off := func(name string) int { return sunspec.L704.Offset(name) }
 	cases := []struct {
@@ -87,7 +90,8 @@ func TestL704EnvelopeSpansAreContiguous(t *testing.T) {
 	}{
 		{"WMaxLimPct axis", "WMaxLimPctEna", []string{"WMaxLimPctEna", "WMaxLimPct"}, 2},
 		{"PFWInj axis", "PFWInj_PF", []string{"PFWInj_PF", "PFWInj_Ext"}, 2},
-		{"WSet axis", "WSetEna", []string{"WSetEna", "WSetMod", "WSet"}, 4},
+		{"WSet axis value", "WSet", []string{"WSet"}, 2},
+		{"WSet axis enable", "WSetEna", []string{"WSetEna"}, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -100,7 +104,7 @@ func TestL704EnvelopeSpansAreContiguous(t *testing.T) {
 				o := off(name)
 				if o != cursor {
 					t.Fatalf("L704 point %q is at offset %d, want %d (span starting at %q is no longer "+
-						"contiguous — ext005Write/ext006Write/ext008Write's single-request write "+
+						"contiguous — ext005Write/ext006Write/ext008WriteWSet's single-request write "+
 						"assumption no longer holds)", name, o, cursor, c.first)
 				}
 				f, ok := sunspec.L704.FieldOf(name)

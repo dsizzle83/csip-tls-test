@@ -239,17 +239,19 @@ func read704(ctx context.Context, rc *certify.RunCtx) (got sunspec.ACControls, o
 // precondition: does this DER declare FIXED_W at all?
 //
 // REV0907-D2-P6C: on the bench solar DER it does not, and a standing mbaps
-// WSet write drew Modbus exception 02 (illegal data address) from the
-// product's own pre-ack capability gate (internal/authority mbapsin.go's
-// setpoint-axis-incapable rule) before any envelope arbitration ever ran —
-// WSet is simply not a commandable point on a DER that never advertises the
-// capability, the same way a legacy 12x DER's absent model 704 makes it not a
-// commandable point at all (oracleFixedW's own LEGACY branch). The write
-// SPAN itself is not in question: TestL704EnvelopeSpansAreContiguous already
-// pins WSetEna(1)+WSetMod(1)+WSet(2) as exactly the 4 contiguous registers
-// ext008WriteWSet requests, matching L704's own declared field types
-// (Tenum16, Tenum16, Tint32) register-for-register, so the exception is the
-// capability gate, not a span crossing a non-writable point.
+// WSet write drew Modbus exception 02 (illegal data address). The first
+// reading of that 02 (this row's FIXED_W precondition, kept because it is a
+// real precondition) was wrong: the 2026-09-10 re-run passed the precondition
+// and still drew 02. The actual source is the product's SUN-002 pre-ack
+// executability gate (lexa-gw internal/writes CheckExecutable over
+// regmap's executedCommandPoints): WSetMod is advertised as writable but has
+// NO executor in the product, so any window that covers it is refused 02
+// before the ack — and this row's original single 4-register span
+// WSetEna+WSetMod+WSet covered it. The row therefore writes the axis the way
+// an EMS that respects SUN-002 must: WSet (Tint32, 2 registers) first, then
+// WSetEna (Tenum16, 1 register), two Write Multiple Registers requests that
+// never touch WSetMod (see ext008WriteWSet). TestL704EnvelopeSpansAreContiguous
+// pins both spans against L704's declared field order.
 func read702CtrlModes(ctx context.Context, rc *certify.RunCtx) (modes uint32, ok bool, why string) {
 	uv, err := oracleUnitView(ctx, rc, oracleSimName)
 	if err != nil {
@@ -1568,22 +1570,38 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 	}
 }
 
-// ext008WriteWSet encodes and sends one WSetEna/WSetMod/WSet write — the
-// three are contiguous in L704 (pinned by TestL704EnvelopeSpansAreContiguous).
+// ext008WriteWSet sends the active-power setpoint as two Write Multiple
+// Registers requests — WSet (Tint32, 2 registers) first so the value is in
+// place before the function is enabled, then WSetEna (Tenum16, 1 register) —
+// and never the WSetMod register between them, which the product refuses 02
+// before the ack because it has no executor (REV0907-D2-P6C; SUN-002). Both
+// spans are pinned by TestL704EnvelopeSpansAreContiguous. The returned
+// outcome is the first non-ACK of the two (the WSet write's if it was
+// refused, else the WSetEna write's), so a refusal on either register is what
+// the row grades; when both ACK the outcome is the WSetEna write's ACK.
 func ext008WriteWSet(sess *suitessm.EnvelopeSession, model suitessm.ModelBlock, watts float64) (envelopeWriteOutcome, error) {
 	block, err := readModelBlock(sess, model, "EXT-008 model 704 pre-write read")
 	if err != nil {
 		return envelopeWriteOutcome{}, err
 	}
-	off, span, err := contiguousWrite(sunspec.L704, block, "WSetEna", 4, func(v sunspec.View) error {
-		v.SetBool("WSetEna", true)
-		v.SetEnum("WSetMod", sunspec.M704_WSetMod_Watts)
+	off, span, err := contiguousWrite(sunspec.L704, block, "WSet", 2, func(v sunspec.View) error {
 		return v.SetFloat("WSet", watts)
 	})
 	if err != nil {
 		return envelopeWriteOutcome{}, err
 	}
-	return mbapsWriteSpan(sess, model, off, span, fmt.Sprintf("EXT-008 WSet write (%.1f W)", watts)), nil
+	w := mbapsWriteSpan(sess, model, off, span, fmt.Sprintf("EXT-008 WSet write (%.1f W)", watts))
+	if !w.Acked {
+		return w, nil
+	}
+	off, span, err = contiguousWrite(sunspec.L704, block, "WSetEna", 1, func(v sunspec.View) error {
+		v.SetBool("WSetEna", true)
+		return nil
+	})
+	if err != nil {
+		return envelopeWriteOutcome{}, err
+	}
+	return mbapsWriteSpan(sess, model, off, span, "EXT-008 WSetEna write (enable)"), nil
 }
 
 // gradeStandingWrite is EXT-008's first criterion.
