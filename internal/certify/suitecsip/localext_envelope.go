@@ -310,6 +310,44 @@ func recallFinding(params map[string]string, key string) Finding {
 // measuring something the design does not claim takes one.
 const envelopeSettle = 5 * time.Second
 
+// awaitCancelAcknowledged is the release fence EXT-006/EXT-008's Change hooks
+// stand behind before they read "the device default at release" or attempt
+// the post-release mbaps write. REV0907-D2-P6A (bench 2026-09-10,
+// runs/p6-rerun-be30002-20260910T162613Z): both rows POSTed the cancel and
+// slept envelopeSettle (5 s), but the DUT is a POLLING client — it learns of
+// a cancel only on its next walk, up to a whole pollRate later — so the
+// "at release" read and the "post-release" write both landed BEFORE the DUT
+// had ever seen the cancel (journal: cancel at ~12:42:48, the row's reads
+// and write at 12:42:53, the DUT's poll + release at 12:43:01). The
+// observations those rows graded as "the axis stayed CSIP-owned" were
+// measurements of a control still legitimately in force. The fence is the
+// same fact the design names as the release moment: the DUT's own Response
+// status=6 (Table 27 "event cancelled") for the control, observed at the
+// server, within the row's own poll-cycle window (d.pollWindow — the same
+// window the Want phase waited on, so the two halves of a row share one
+// cadence). base must be snapshotted BEFORE the cancel is posted, so a
+// status=6 that predates the cancel (impossible for a live control, but a
+// stale log line from an earlier run is not) cannot satisfy it.
+func awaitCancelAcknowledged(ctx context.Context, d *Driver, base ServerView, mrid string) (waited time.Duration, ok bool) {
+	_, waited, ok = d.Await(ctx, d.pollWindow, base.WantResponseAtLeast(mrid, 6))
+	if ok {
+		d.rc.Logf("the DUT acknowledged the cancel (Response status>=6 for %s) after %s", mrid, waited.Round(rounding))
+	} else {
+		d.rc.Logf("the DUT did not acknowledge the cancel (no Response status>=6 for %s) within %s", mrid, d.pollWindow)
+	}
+	return waited, ok
+}
+
+// cancelNotAcknowledged is the finding the release-phase criteria carry when
+// awaitCancelAcknowledged came back false: measuring the DER then would grade
+// a control still in force as a failed release, which is the exact
+// misattribution REV0907-D2-P6A's first reading made.
+func cancelNotAcknowledged(mrid string, window time.Duration, what string) Finding {
+	return unavailable("the DUT never POSTed a Response status=6 for the cancelled control %s within the "+
+		"poll-cycle window (%s), so %s could not be measured at a moment the axis was known to be released — "+
+		"the control was still in force for everything this phase observed", mrid, window, what)
+}
+
 // envelopeControlDurationS is every EXT-005..008 CSIP control's own event
 // interval — long relative to the row's own window, the same "genuinely LIVE,
 // not merely elapsed" discipline ext002ControlDurationS documents.
@@ -679,12 +717,22 @@ func envelopeValueAxisOwnershipSpec(nonce string) spec {
 			// The server-cancel idiom EXT-002/EXT-003 use (localext_eventstatus.go's
 			// doc): a status-only update on the SAME mRID, driving the control to
 			// Annex B currentStatus 2 — releasing CSIP's ownership of the axis.
+			preCancel := d.Snapshot(ctx)
 			if _, err := d.PostControl(ctx, ControlRequest{Program: envelopeProgram, MRID: mrid, Cancel: true}); err != nil {
 				return err
 			}
-			// Design §1.1: "when a control ends, the envelope relaxes to the
-			// default" — this settle is the propagation window for lexa-mode to
-			// notice the cancellation and recompose before either read below.
+			// The DUT polls: it sees the cancel on its next walk, not on the
+			// POST. Stand behind its own status=6 (awaitCancelAcknowledged's
+			// doc, REV0907-D2-P6A) and only THEN give lexa-mode the design
+			// §1.1 propagation settle ("when a control ends, the envelope
+			// relaxes to the default") before either read below.
+			if _, acked := awaitCancelAcknowledged(ctx, d, preCancel, mrid); !acked {
+				stashFinding(params, ext006DefaultKey, cancelNotAcknowledged(mrid, d.pollWindow,
+					"the DER's own PF register at release"))
+				stashFinding(params, ext006ReleasedKey, cancelNotAcknowledged(mrid, d.pollWindow,
+					"the post-release mbaps PFWInj_PF write"))
+				return nil
+			}
 			if err := d.rc.Sleep(ctx, envelopeSettle); err != nil {
 				return err
 			}
@@ -1484,8 +1532,16 @@ func envelopeOwnershipTakeSpec(nonce string) spec {
 			return nil
 		},
 		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			preCancel := d.Snapshot(ctx)
 			if _, err := d.PostControl(ctx, ControlRequest{Program: envelopeProgram, MRID: mrid, Cancel: true}); err != nil {
 				return err
+			}
+			// Same release fence as EXT-006 (awaitCancelAcknowledged's doc,
+			// REV0907-D2-P6A): the DUT's own status=6 first, then the settle.
+			if _, acked := awaitCancelAcknowledged(ctx, d, preCancel, mrid); !acked {
+				stashFinding(params, ext008DefaultKey, cancelNotAcknowledged(mrid, d.pollWindow,
+					"the DER's own WSet enable at release"))
+				return nil
 			}
 			if err := d.rc.Sleep(ctx, envelopeSettle); err != nil {
 				return err

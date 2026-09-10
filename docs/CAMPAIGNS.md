@@ -217,7 +217,14 @@ with the reason it needs that lane. In outline:
   span `WSetEna`+`WSetMod`+`WSet` was refused before the ack. The row now
   writes the axis as two requests that never cover `WSetMod` — `WSet` (2
   registers) then `WSetEna` (1 register), both pinned contiguous against
-  L704's own declared field types. All four share `csip` for the same reason as
+  L704's own declared field types. Both EXT-006 and EXT-008 also stand behind
+  a release fence before anything 'at release' is measured: the DUT is a
+  polling client, so after the admin cancel each row waits for the DUT's own
+  Response status=6 for the mRID (snapshot taken before the cancel, the row's
+  poll-cycle window as the budget) and only then settles and reads/writes —
+  the 2026-09-09/10 'axis stays CSIP-owned after release' observations were
+  measurements taken before the DUT had seen the cancel (REV0907-D2-P6A
+  re-read; `awaitCancelAcknowledged`). All four share `csip` for the same reason as
   `EXT-001…004`: a CSIP control's own limits ARE the envelope these rows
   write an mbaps request against, so the CSIP control path must own
   `lexa/desired/*` for there to be an envelope to measure at all.
