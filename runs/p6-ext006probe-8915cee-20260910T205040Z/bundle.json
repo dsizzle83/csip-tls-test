@@ -1,0 +1,183 @@
+{
+  "schema": "lexa-evidence-bundle/2",
+  "run": {
+    "tool": "csip-certify",
+    "tool_version": "eb2c71acf25f",
+    "git_commit": "f69a8ce598df7d655c12fc317b6e0e442f934759",
+    "command": [
+      "certify-keylog",
+      "-uid",
+      "local-ext-v1::EXT-006",
+      "-manifest",
+      "/home/dmitri/projects/lexa-gw/configs/candidate.json",
+      "-target",
+      "192.168.0.69:802",
+      "-pki",
+      "certs/mbaps",
+      "-gridsim",
+      "192.168.0.188:11113",
+      "-gridsim-admin",
+      "http://192.168.0.188:11114",
+      "-modsim",
+      "69.0.0.20:5020",
+      "-modsim-api",
+      "http://69.0.0.20:6020",
+      "-mbapsdev-api",
+      "http://69.0.0.20:6031",
+      "-gateway-ssh",
+      "cc93",
+      "-metrics-endpoint",
+      "http://127.0.0.1:9102/metrics",
+      "-keylog",
+      "/tmp/bench-shared.keylog",
+      "-operator",
+      "lead reseed probe",
+      "-dut-name",
+      "lexa-gw",
+      "-dut-build",
+      "8915cee",
+      "-iface",
+      "wlp2s0",
+      "-timeout",
+      "10m",
+      "-out",
+      "runs/p6-ext006probe-8915cee-20260910T205040Z",
+      "-v"
+    ],
+    "host": "dmitri-HP-ENVY-TE01-1xxx",
+    "operator": "lead reseed probe",
+    "note": "catalog: /home/dmitri/projects/csip-tls-test/testdata/catalog/catalog.json (290 cases, 1626330 bytes, sha256:eb2c71acf25fe8b26876d5fd0783cfdd1fb74a3efb21885ebaafa4b67a285588); frame attribution: 19558 frames: 937 attributed to 1 test case(s), 18621 unattributed (background), 0 contested; provenance: DUT build reported fw=1.0.0 build_id=8915cee2fd56 image_build_id=8915cee2fd56 image_profile=image; EXPLORATORY, NOT GATING: no -campaign was declared: this is an EXPLORATORY selection, and its result is evidence about the implementation rather than a campaign anything may rest on",
+    "started": "2026-09-10T20:50:40.759169421Z",
+    "finished": "2026-09-10T20:54:53.130458997Z",
+    "dut": {
+      "name": "lexa-gw",
+      "address": "192.168.0.69:802",
+      "build": "8915cee",
+      "build_reported": "8915cee2fd56",
+      "image_build_id": "8915cee2fd56",
+      "image_profile": "image"
+    },
+    "campaign": {
+      "authority": "csip",
+      "authority_observed": "csip",
+      "gating": false,
+      "exploratory": "no -campaign was declared: this is an EXPLORATORY selection, and its result is evidence about the implementation rather than a campaign anything may rest on"
+    },
+    "candidate": {
+      "path": "/home/dmitri/projects/lexa-gw/configs/candidate.json",
+      "sha256": "24653c0eac0fa622bd0743dba6c63d4d04345b1e88f367f26c64f0d952612476",
+      "profile": "one-to-one-7xx-tcp"
+    },
+    "keylog": {
+      "lines_kept": 10,
+      "lines_dropped": 3355
+    }
+  },
+  "capture": {
+    "tool": "dumpcap",
+    "tool_version": "Dumpcap (Wireshark) 4.2.2 (Git v4.2.2 packaged as 4.2.2-1.1build3).",
+    "command": [
+      "/usr/bin/dumpcap",
+      "-i",
+      "wlp2s0",
+      "-w",
+      "runs/p6-ext006probe-8915cee-20260910T205040Z/capture/run-20260910-205042.pcapng",
+      "-q",
+      "-p"
+    ],
+    "interface": "wlp2s0",
+    "filter": "",
+    "path": "capture/run-20260910-205042.pcapng",
+    "format": "pcapng",
+    "started": "2026-09-10T20:50:42.260284177Z",
+    "stopped": "2026-09-10T20:54:53.048056509Z",
+    "duration": "4m10.788s",
+    "file_bytes": 13606016,
+    "packets": 19558,
+    "first_packet": "2026-09-10T20:50:42.611754809Z",
+    "last_packet": "2026-09-10T20:54:52.907761822Z",
+    "stderr": "Capturing on 'wlp2s0'\nFile: runs/p6-ext006probe-8915cee-20260910T205040Z/capture/run-20260910-205042.pcapng\n\rPackets captured: 19558\nPackets received/dropped on interface 'wlp2s0': 19558/0 (pcap:0/dumpcap:0/flushed:0/ps_ifdrop:0) (100.0%)",
+    "interfaces": [
+      {
+        "id": 0,
+        "name": "wlp2s0",
+        "captured": 19558,
+        "kept": 19558
+      }
+    ]
+  },
+  "files": {
+    "capture": "capture/run-20260910-205042.pcapng",
+    "keylog": "capture/bench-shared.keylog",
+    "extra": [
+      "candidate.json",
+      "catalog.json",
+      "COVERAGE.md"
+    ]
+  },
+  "cases": [
+    {
+      "id": "local-ext-v1::EXT-006",
+      "doc": "LOCAL-EXT-v1 v1 (local extension family; not a published specification) §1.6 EXT-006 - a CSIP-owned value axis refuses mbaps (01) and releases to the device default (under 1 Local product-evidence extensions)",
+      "title": "EXT-006 - CSIP-owned value axis: mbaps refused (01) while owned; acked and applied after release; release restores the device default",
+      "verdict": "PASS",
+      "applicable": true,
+      "non_certifiable": true,
+      "notes": "Live-phase observation (what the check's own socket saw; the numbered assertions below are re-derived from the capture and are the verdict): published a CSIP opModFixedPFInjectW control (CERT-EXT006-VALUE-AXIS-b99e2753, PF 0.9 injecting) and waited 3m0s for it to be Started, attempted an mbaps GridServiceSunSpec PFWInj_PF write (PF 0.85) while it was in effect, then cancelled it and attempted the same write again — docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2 (Fixed PF row); poll-cycle window: 2m30s, derived from the bench 2030.5 server's advertised pollRate of 1m0s (poll_rate_s from http://192.168.0.188:11114/admin/status), which is the rate a client in poll_rate_mode \"honor\" — the product default — paces its walk at, the configured interval being only a floor beneath it — it is the slower of that and the DUT's own IEEE 2030.5 discovery interval floor of 1m0s (discovery_interval_s in /etc/lexa/northbound.json), and the slower governs: 2 periods plus 30s of slack, so a period that had just elapsed still leaves a whole one inside the window; VERDICT RECONCILED — the live phase declared SKIP from what the socket saw; the citation phase re-derived the criteria from the capture and the case is PASS. The capture-derived verdict is the one that stands: it is the only one a reader of this bundle can repeat.\n\nFrame attribution: 937 frame(s) (924–19473), precision endpoint; 18536 frame(s) inside the window belonged to other conversations and were excluded.\n\nConnections claimed: tcp *:* \u003c\u003e 192.168.0.188:11113 (the DUT dials OUT to the bench's 2030.5 server, so this check cannot know the DUT's ephemeral local port and cannot claim a full 4-tuple. The claim is therefore every TCP frame to or from the CSIP server endpoint during this check's interval. That is sound on this bench because the endpoint is the gridsim simulator and the gateway under test is its only client; it would NOT be sound if a second conformance run were driving the same simulator concurrently, which is why live runs in this campaign are serialized); tcp 192.168.0.188:52682 \u003c\u003e 192.168.0.69:802 (REV0907-D2-IMPL P5 envelope session: grid-service).",
+      "assertions": [
+        {
+          "claim": "the DUT POSTed a DERControlResponse with status=2 (Event started) for the control under test",
+          "method": "decrypted HTTP/2030.5 transcript from the capture (NSS key log) — the sep+xml body of a POST in the session whose root element is a Response family member, matched on \u003csubject\u003e and \u003cstatus\u003e",
+          "verdict": "PASS",
+          "observed": "POST /rsps/0/r carrying Response subject=CERT-EXT006-VALUE-AXIS-b99e2753 status=2, answered 201 Created. These bytes are from 192.168.0.69:40868 \u003c\u003e 192.168.0.188:11113, a SECOND conversation this test case wholly owns: the DUT opened it alongside the discovery walk recovered as this window's session (192.168.0.69:40856 \u003c\u003e 192.168.0.188:11113), and a frame of it is a frame this case may cite",
+          "frames": [
+            2627
+          ],
+          "stream_ref": "192.168.0.69:40868 \u003e 192.168.0.188:11113",
+          "byte_range": [
+            2751,
+            3142
+          ],
+          "bytes_sha256": "658fd1368f4f85b5ca2a2af2c4767475a967f8df7bde9d58a9c56e1ae95efc37",
+          "note": "frames attributed by remote endpoint and time, not by connection 4-tuple: the DUT dials OUT to the bench's 2030.5 server, so this check cannot know the DUT's ephemeral local port and cannot claim a full 4-tuple. The claim is therefore every TCP frame to or from the CSIP server endpoint during this check's interval. That is sound on this bench because the endpoint is the gridsim simulator and the gateway under test is its only client; it would NOT be sound if a second conformance run were driving the same simulator concurrently, which is why live runs in this campaign are serialized"
+        },
+        {
+          "claim": "while the CSIP opModFixedPFInjectW control (CERT-EXT006-VALUE-AXIS-b99e2753) is in effect, an mbaps GridServiceSunSpec write to 704 PFWInj_PF draws Modbus exception 01 (illegal function) and the DER's own PF register does not move — docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2 (Fixed PF: \"refused (01) while CSIP-owned\")",
+          "method": "this row's own role-bound mbaps TLS session (GridServiceSunSpec), decoded with lexa-proto/mbap wire framing only — independent of the DUT's CSIP path, the gridsim admin log, and any product parser (suitessm.DialEnvelopeRole) — this row's own mbaps write to PFWInj_PF/_Ext, decoded from the raw MBAP response; the DER's own model 704 PF sync group read independently before and after the write",
+          "verdict": "PASS",
+          "observed": "the write drew Modbus exception 01 (illegal function) as docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2 requires, and the DER's own PF register did not move: ena=true pf=0.9 ext=0 before and after",
+          "byte_range": [
+            0,
+            0
+          ],
+          "note": "not wire-cited; source: the run's capture, but the evaluator did not record which frames carried the fact",
+          "load_bearing": true
+        },
+        {
+          "claim": "docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2's release rule (owner answer B, \"device default\"): immediately after CSIP releases the axis (before this row's second mbaps write), the DER's own PF register reads the SAME value this row observed before the CSIP control was ever published — never a value mbaps held",
+          "method": "this row's own role-bound mbaps TLS session (GridServiceSunSpec), decoded with lexa-proto/mbap wire framing only — independent of the DUT's CSIP path, the gridsim admin log, and any product parser (suitessm.DialEnvelopeRole) — the DER's own model 704 PF sync group, read once before this row published its CSIP control (the device-default baseline) and again immediately after the control's cancellation was served and this row's settle window elapsed, both through the same southbound oracle path",
+          "verdict": "PASS",
+          "observed": "at release PFWInjEna reads false, matching this row's own pre-publication baseline (also false) — the axis is no longer in force, the device default docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2 owner answer B requires (reported, not asserted: raw PF register reads pf=0.9 ext=0, baseline was pf=0 ext=0 — a 704 DER's value register keeps its last-written contents after Ena clears, which is not what this claim is about)",
+          "byte_range": [
+            0,
+            0
+          ],
+          "note": "not wire-cited; source: the run's capture, but the evaluator did not record which frames carried the fact",
+          "load_bearing": true
+        },
+        {
+          "claim": "after the control ends, the same mbaps write is acked and the DER's own PF register moves to the mbaps-commanded value (PF 0.85) — docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2 (\"else mbaps\")",
+          "method": "this row's own role-bound mbaps TLS session (GridServiceSunSpec), decoded with lexa-proto/mbap wire framing only — independent of the DUT's CSIP path, the gridsim admin log, and any product parser (suitessm.DialEnvelopeRole) — this row's own second mbaps write to PFWInj_PF/_Ext, issued after the CSIP control's cancellation, decoded from the raw MBAP response; the DER's own model 704 PF sync group read independently afterward",
+          "verdict": "PASS",
+          "observed": "the write was ACKED, and the DER's own PF register moved to it: pf=0.8500000000000001 ext=0",
+          "byte_range": [
+            0,
+            0
+          ],
+          "note": "not wire-cited; source: the run's capture, but the evaluator did not record which frames carried the fact",
+          "load_bearing": true
+        }
+      ]
+    }
+  ]
+}
